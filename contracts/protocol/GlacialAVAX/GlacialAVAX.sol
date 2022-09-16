@@ -12,8 +12,6 @@ import { IGLendingPool } from "../../interfaces/IGLendingPool.sol";
 import { AccessControlManager } from "../../AccessControlManager.sol";
 import { GlacierAddressBook } from "../../GlacierAddressBook.sol";
 
-import "hardhat/console.sol";
-
 /**
  * @title  Glacial AVAX ERC-20 token implementation
  * @author Jack Frost

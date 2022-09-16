@@ -3,6 +3,11 @@ pragma solidity ^0.8.10;
 
 import { AccessControlUpgradeable } from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 
+/**
+ * @title AccessControlManager contract
+ * @author Jack Frost
+ * @notice Manages the roles for the protocol
+ */
 contract AccessControlManager is AccessControlUpgradeable {
 
     /// @notice If a wallet or a contract has this role set, they can restore the network and request withdrawals from the Glacier Network

@@ -9,8 +9,6 @@ import { IGReserveStrategy } from "../../interfaces/IGReserveStrategy.sol";
 import { IGReservePool } from "../../interfaces/IGReservePool.sol";
 import { AccessControlManager } from  "../../AccessControlManager.sol";
 
-import "hardhat/console.sol";
-
 /**
  * @title  Glacial Reserve Pool implementation
  * @author Jack Frost
