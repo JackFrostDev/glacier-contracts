@@ -13,28 +13,36 @@ import { AccessControlManager } from "../../AccessControlManager.sol";
 import { GlacierAddressBook } from "../../GlacierAddressBook.sol";
 
 /**
- * @title  Glacial AVAX ERC-20 token implementation
+ * @title  Interest bearing ERC-20 token implementation
  * @author Jack Frost
- * @notice GlacialAvax (glAVAX) is a DeFi-friendly AVAX derivative that represents AVAX deposited into the Glacier protocol. It can be redeemed back for AVAX at an exchange rate that builds value over time based on the 
- *         performance and accrued rewards from the Glacier network.
+ * @notice Glacial Avax (glAVAX) is an AVAX derivative ERC-20 token that represents AVAX deposited into the Glacier protocol.
+ *         
+ * Users can mint glAVAX by depositing AVAX at a 1:1 rate, where the contract will give the user shares of the overall network depending on their
+ * proportion of AVAX against the proportion of overall AVAX.
+ * 
+ * Users can then redeem back their AVAX at a 1:1 rate for the balance of their glAVAX.
  *
- *         Handles all of the depositing and withdrawing, the exchange rate between AVAX <-> glAVAX, the rebalancing logic and the withdraw requests.
+ * glAVAX balances are rebased automatically by the network to include all accrued rewards from deposits.
  */
-contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, ReentrancyGuardUpgradeable {
-
+contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, PausableUpgradeable, ReentrancyGuardUpgradeable {
+    
     /// @notice Token Info
     string private constant NAME     = "Glacial AVAX";
     string private constant SYMBOL   = "glAVAX";
     uint8  private constant DECIMALS = 18;
 
-    /// @notice Token balances
-    mapping(address => uint256) public _balances;
+    /// @notice The underlying share balances for user deposits
+    /// @dev These act as a way to calculate how much AVAX a user has a claim to in the network
+    mapping(address => uint256) public _shares;
     
     /// @notice The token allowances
     mapping(address => mapping(address => uint256)) public _allowances;
+
+    /// @notice The maximum allowed minted Glacial AVAX
+    uint256 public _maxSupply;
     
-    /// @notice The total supply that is currently in circulation
-    uint256 public _totalGlavax;
+    /// @notice The total network shares that have a claim by depositors
+    uint256 public _totalShares;
 
     /// @notice The Glacier protocol addresses
     GlacierAddressBook public addresses;
@@ -55,30 +63,30 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
     uint256 public claimableAmount;
     
     struct WithdrawRequest {
-        uint256 glavaxAmount;
-        uint256 avaxAmount;
+        address user;
+        uint256 amount;
         uint256 timestamp;
         bool fufilled;
         bool claimed;
     }
 
     /// @notice A mapping of withdraw requests to their IDs
-    mapping(uint256 => WithdrawRequest) public _withdrawRequests;
+    mapping(uint256 => WithdrawRequest) public withdrawRequests;
 
     /// @notice A counter for the withdraw requests
-    uint256 public _totalWithdrawRequests;
+    uint256 public totalWithdrawRequests;
 
     /// @notice A counter for how many withdraw requests have been fufilled
-    uint256 public _totalWithdrawRequestsFufilled;
+    uint256 public totalWithdrawRequestsFufilled;
 
     /// @notice A mapping of withdraw request IDs to the owner IDs
-    mapping(uint256 => uint256) public _withdrawRequestIndex;
+    mapping(uint256 => uint256) public withdrawRequestIndex;
 
     /// @notice A mapping of withdrawers to another mapping of the owner index to the withdraw request ID
-    mapping(address => mapping(uint256 => uint256)) public _userWithdrawRequests;
+    mapping(address => mapping(uint256 => uint256)) public userWithdrawRequests;
 
     /// @notice A mapping of withdrawers to the total amount of withdraw requests
-    mapping(address => uint256) public _userWithdrawRequestCount;
+    mapping(address => uint256) public userWithdrawRequestCount;
 
     /// @notice Emitted when a user deposits AVAX into Glacier
     /// @param avaxAmount Is in units of AVAX to mark the historical conversion rate
@@ -111,6 +119,9 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
     /// @notice Emitted when AVAX is refilled into this contract
     event RefillAVAX(uint256 amount);
 
+    /// @notice Emitted when the contract fufills a user withdraw request
+    event FufilledUserWithdrawal(address indexed user, uint256 requestID, uint256 amount);
+
     function initialize(GlacierAddressBook _addresses) initializer public {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(NETWORK_MANAGER, msg.sender);
@@ -120,6 +131,34 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
         // Approve the spending of WAVAX in this control by the reserve pool and the lending pool
         IERC20Upgradeable(addresses.wavaxAddress()).approve(addresses.reservePoolAddress(), type(uint256).max);
         IERC20Upgradeable(addresses.wavaxAddress()).approve(addresses.lendingPoolAddress(), type(uint256).max);
+    }
+
+    /**
+     * ===================================================
+     *                  ADMIN FUNCTIONS
+     * ===================================================
+     */
+
+    /**
+     * @notice Sets the maximum amount of AVAX we're taking on.
+     * @dev Set to 0 to disable
+     */
+    function setMaxSupply(uint256 amount) external isRole(NETWORK_MANAGER) {
+        _maxSupply = amount;
+    }
+
+    /**
+     * @notice Stops accepting new AVAX deposits into the protocol, while still allowing withdrawals to continue.
+     */
+    function pauseDeposits() external isRole(NETWORK_MANAGER) {
+        _pause();
+    }
+
+    /**
+     * @notice Resumes accepting new AVAX deposits
+     */
+    function resumeDeposits() external isRole(NETWORK_MANAGER) {
+        _unpause();
     }
 
     /**
@@ -138,9 +177,21 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
 
     /**
      * @notice Sets the new network total
+     * @dev To be used manually by the development team
+     * 
+     * Requirements:
+     *  - The contract must not be paused
      */
-    function setNetworkTotal(uint256 newNetworkTotal) external isRole(NETWORK_MANAGER) {
+    function setNetworkTotal(uint256 newNetworkTotal) external isRole(NETWORK_MANAGER) whenPaused {
         totalNetworkAVAX = newNetworkTotal;
+    }
+
+    /**
+     * @notice Increases the network total by `amount`
+     * @dev To be called by the network manager
+     */
+    function increaseNetworkTotal(uint256 amount) external isRole(NETWORK_MANAGER) {
+        totalNetworkAVAX += amount;
     }
 
     /**
@@ -191,37 +242,21 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
     }
 
     /**
+     * ===================================================
+     *                  BASIC FUNCTIONS
+     * ===================================================
+     */
+
+    /**
      * @notice Deposits AVAX into the Glacier protocol
      */
     receive() external payable {}
 
     /**
-     * @notice Helper function to return a users current AVAX they'd receive for a specific amount of glAVAX
+     * @notice ERC-20 function to return the total amount of AVAX in the system
      */
-    function avaxBalance(address user) external view returns (uint256) {
-        return avaxFromGlavax(balanceOf(user));
-    }
-
-    /**
-     * @notice Calculates how much AVAX you'd receive for glAVAX
-     */
-    function avaxFromGlavax(uint256 glavaxAmount) public view returns (uint256) {
-        uint256 totalAvax = netAVAX();
-        if (_totalGlavax == 0) {
-            return glavaxAmount;
-        }
-        return glavaxAmount * totalAvax / _totalGlavax;
-    }
-
-    /**
-     * @notice Calculates how much glAVAX you'd receive for AVAX
-     */
-    function glavaxFromAvax(uint256 avaxAmount) public view returns (uint256) {
-        uint256 totalAvax = netAVAX();
-        if (totalAvax == 0 || _totalGlavax == 0) {
-            return avaxAmount;
-        }
-        return avaxAmount * _totalGlavax / totalAvax;
+    function totalSupply() public view virtual override returns (uint256) {
+        return netAVAX();
     }
 
     /**
@@ -253,16 +288,73 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
     }
 
     /**
-     * @notice Returns the total amount of liquidity there is to facilitate a withdrawal
+     * @notice Returns the total amount of liquidity there is to facilitate withdrawals
      */
-    function liquidity() public returns (uint256) {
-        return deposits() + IGReservePool(addresses.reservePoolAddress()).totalReserves() + IGLendingPool(addresses.lendingPoolAddress()).totalReserves() + IGLendingPool(addresses.lendingPoolAddress()).purchasingPower();
+    function liquidity() public view returns (uint256) {
+        // FUTURE FEATURE: Adding USDC purchaser to help offset delta risk
+        return deposits() + IGReservePool(addresses.reservePoolAddress()).totalReserves() + IGLendingPool(addresses.lendingPoolAddress()).totalReserves();
     }
 
     /**
-     * @notice Calculates whether or not a certain amount of AVAX will throttle the network
+     * @notice Returns the users balance
      */
-    function willThrottleNetwork(uint256 withdrawalAmount) public returns (bool) {
+    function balanceOf(address account) public view virtual override returns (uint256) {
+        return avaxFromShares(_shares[account]);
+    }
+
+    function sharesOf(address account) public view returns (uint256) {
+        return _shares[account];
+    }
+
+    /**
+     * @notice Returns the amount of shares correspond to the `avaxAmount`
+     */
+    function sharesFromAvax(uint256 avaxAmount) public view returns (uint256) {
+        uint256 totalAvax = netAVAX();
+        if (totalAvax == 0 || _totalShares == 0) {
+            return avaxAmount;
+        }
+        return avaxAmount * _totalShares / totalAvax;
+    }
+
+    /**
+     * @notice Returns the amount of AVAX that corresponds to the `shareAmount`
+     */
+    function avaxFromShares(uint256 shareAmount) public view returns (uint256) {
+        uint256 totalAvax = netAVAX();
+        if (_totalShares == 0) {
+            return shareAmount;
+        }
+        return shareAmount * totalAvax / _totalShares;
+    }
+
+    /**
+     * @notice Mints shares to a user account
+     */
+    function _mintShares(address account, uint256 shareAmount) internal virtual {
+        require(account != address(0), "ERC20: mint to the zero address");
+
+        _totalShares += shareAmount;
+        _shares[account] += shareAmount;
+    }
+
+    /**
+     * @notice Burns shares from a user account
+     */
+    function _burnShares(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: burn from the zero address");
+        uint256 accountBalance = _shares[account];
+        require(accountBalance >= amount, "ERC20: burn amount exceeds balance");
+        unchecked {
+            _shares[account] = accountBalance - amount;
+        }
+        _totalShares -= amount;
+    }
+
+    /**
+     * @notice Calculates whether or not a certain amount of AVAX withdrawal will throttle the network
+     */
+    function willThrottleNetwork(uint256 withdrawalAmount) public view returns (bool) {
         uint256 liq = liquidity();
         if (withdrawalAmount > liq) {
             return true;
@@ -276,9 +368,12 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
      * @param user The user that is initiating this deposit
      * @param referralCode The referral code of someone
      */
-    function deposit(address user, uint64 referralCode) public payable nonReentrant {
+    function deposit(address user, uint64 referralCode) public payable nonReentrant whenNotPaused returns (uint256) {
         require(msg.sender == user, "USER_NOT_SENDER");
         require(msg.value > 0, "ZERO_DEPOSIT");
+        if (_maxSupply > 0) {
+            require(totalAVAX() + msg.value <= _maxSupply, "MAXIMUM_AVAX_REACHED");
+        }
 
         uint256 avaxAmount = msg.value;
 
@@ -290,19 +385,21 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
         avaxAmount = _repayLiquidity(avaxAmount);
 
         // Mint back to the user the total glAVAX amount of their AVAX deposit
-        uint256 glavaxAmount = glavaxFromAvax(msg.value);
-        _mint(user, glavaxAmount);
+        uint256 sharesAmount = sharesFromAvax(msg.value);
+        _mintShares(user, sharesAmount);
 
         // Otherwise leave the AVAX in the contract
         IWAVAX(addresses.wavaxAddress()).deposit{value: avaxAmount}();
 
         emit Deposit(user, msg.value, referralCode);
+
+        return sharesAmount;
     }
 
     /**
      * @notice Withdraws AVAX from the Glacier protocol
      * @param user The user that is initiating this withdrawal
-     * @param glavaxAmount The amount in glAVAX
+     * @param amount The amount in glAVAX
      * @dev Withdrawal Sourcing handling:
      *      1. Router AVAX
      *      2. Reserve Pool
@@ -310,13 +407,13 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
      *      4. Atomic Buying
      *      5. Glacier Network
      */
-    function withdraw(address user, uint256 glavaxAmount) external nonReentrant {
+    function withdraw(address user, uint256 amount) external nonReentrant {
         require(msg.sender == user, "USER_NOT_SENDER");
-        require(glavaxAmount > 0, "ZERO_WITHDRAW");
-        require(glavaxAmount <= _balances[user], "INSUFFICIENT_BALANCE");
+        require(amount > 0, "ZERO_WITHDRAW");
+        require(amount <= balanceOf(user), "INSUFFICIENT_BALANCE");
 
         /// @dev We store the variables ahead of execution as this function can end up changing ratios which can affect implicit nature
-        uint256 avaxAmount = avaxFromGlavax(glavaxAmount);
+        uint256 avaxAmount = amount;
         uint256 totalWithdrawAvaxAmount = avaxAmount;
 
         // First check the AVAX that is held on hand
@@ -347,9 +444,9 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
         /// Withdraw AVAX from WAVAX and burn the related glAVAX tokens
         uint256 toWithdraw = totalWithdrawAvaxAmount - avaxAmount;
         if (toWithdraw > 0) {
-            uint256 toBurn = glavaxFromAvax(toWithdraw);
+            uint256 sharesToBurn = sharesFromAvax(toWithdraw);
             IWAVAX(addresses.wavaxAddress()).withdraw(toWithdraw);
-            _burn(user, toBurn);
+            _burn(user, sharesToBurn);
             // Transfer the user with the AVAX
             payable(user).transfer(toWithdraw);
         }
@@ -366,9 +463,7 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
         uint256 borrowAmount = _lendAvax(amount);
         amount -= borrowAmount;
 
-        // Check if there is any USDC that we can use to purchase AVAX
-        uint256 boughtAmount = _buyAvax(amount);
-        amount -= boughtAmount;
+        // TODO: Use other methods of borrowing, i.e. purchasing AVAX atomically
 
         return amount;
     }
@@ -388,27 +483,12 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
     }
 
     /**
-     * @notice Uses the lending pool to purchase up to `amount` in AVAX
-     */
-    function _buyAvax(uint256 amount) internal returns (uint256) {
-        uint256 purchasingPower = IGLendingPool(addresses.lendingPoolAddress()).purchasingPower();
-        if (amount > 0 && purchasingPower > 0) {
-            uint256 buyAmount = amount > purchasingPower ? purchasingPower : amount;
-            uint256 balanceBefore = IERC20Upgradeable(addresses.wavaxAddress()).balanceOf(address(this));
-            IGLendingPool(addresses.lendingPoolAddress()).buyAndBorrow(buyAmount);
-            return IERC20Upgradeable(addresses.wavaxAddress()).balanceOf(address(this)) - balanceBefore;
-        } else {
-            return 0;
-        }
-    }
-
-    /**
      * @notice Repays liquidity that was borrowed by the Glacier Pool
      */
     function _repayLiquidity(uint256 avaxAmount) internal returns (uint256) {
         require(avaxAmount > 0, "ZERO_DEPOSIT");
         uint256 amount = msg.value;
-        uint256 totalWithdrawRequestAmount = totalWithdrawRequests();
+        uint256 totalWithdrawRequestAmount = allWithdrawRequests();
         if (totalWithdrawRequestAmount > 0) {
             uint256 repayAmount = totalWithdrawRequestAmount > amount ? amount : totalWithdrawRequestAmount;
             _fufillUserWithdrawals(repayAmount);
@@ -417,14 +497,15 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
 
         // If any AVAX is owed to the lending pool, prioritize paying this back first before the reserves
         if (amount > 0 && IGLendingPool(addresses.lendingPoolAddress()).totalOwed() > 0) {
-            uint256 totalBought = IGLendingPool(addresses.lendingPoolAddress()).totalBought();
-            uint256 totalLoaned = IGLendingPool(addresses.lendingPoolAddress()).totalLoaned();
-            if (totalBought > 0) {
-                uint256 repayAmount = totalBought > amount ? amount : totalBought;
-                IGLendingPool(addresses.lendingPoolAddress()).repayBought(address(this), repayAmount);
-                amount -= repayAmount;
-            }
+            // FUTURE FEATURE: Adding USDC purchaser to help offset delta risk
+            // uint256 totalBought = IGLendingPool(addresses.lendingPoolAddress()).totalBought();
+            // if (totalBought > 0) {
+            //     uint256 repayAmount = totalBought > amount ? amount : totalBought;
+            //     IGLendingPool(addresses.lendingPoolAddress()).repayBought(address(this), repayAmount);
+            //     amount -= repayAmount;
+            // }
             
+            uint256 totalLoaned = IGLendingPool(addresses.lendingPoolAddress()).totalLoaned();
             if (amount > 0 && totalLoaned > 0) {
                 uint256 repayAmount = totalLoaned > amount ? amount : totalLoaned;
                 IGLendingPool(addresses.lendingPoolAddress()).repay(address(this), repayAmount);
@@ -438,47 +519,45 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
     /**
      * @notice Notifies the network that a withdrawal needs to be made.
      */
-    function _withdrawRequest(address user, uint256 glavaxAmount) internal {
+    function _withdrawRequest(address user, uint256 amount) internal {
         require(msg.sender == user, "USER_NOT_SENDER");
-        require(glavaxAmount <= _balances[user], "INSUFFICIENT_BALANCE");
-
-        uint256 avaxAmount = avaxFromGlavax(glavaxAmount);
+        require(amount <= balanceOf(user), "INSUFFICIENT_BALANCE");
 
         WithdrawRequest memory request = WithdrawRequest({
-            glavaxAmount: glavaxAmount,
-            avaxAmount: 0,
+            user: user,
+            amount: amount,
             timestamp: block.timestamp,
             fufilled: false,
             claimed: false
         });
 
         // Setup the withdraw request data
-        _withdrawRequests[_totalWithdrawRequests] = request;
-        _userWithdrawRequests[user][_userWithdrawRequestCount[user]] = _totalWithdrawRequests;
-        _withdrawRequestIndex[_totalWithdrawRequests] = _userWithdrawRequestCount[user];
-        ++_userWithdrawRequestCount[user];
-        ++_totalWithdrawRequests;
+        withdrawRequests[totalWithdrawRequests] = request;
+        userWithdrawRequests[user][userWithdrawRequestCount[user]] = totalWithdrawRequests;
+        withdrawRequestIndex[totalWithdrawRequests] = userWithdrawRequestCount[user];
+        ++userWithdrawRequestCount[user];
+        ++totalWithdrawRequests;
 
         // Transfer the glAVAX into the contract to hold it for the interim period
-        transferFrom(user, address(this), glavaxAmount);
+        transferFrom(user, address(this), amount);
 
-        emit UserWithdrawRequest(user, avaxAmount);
+        emit UserWithdrawRequest(user, amount);
     }
 
     /**
      * @notice Returns the withdraw request index from a given user by the user withdraw request index
      */
     function requestIdFromUserIndex(address user, uint256 index) public view virtual returns (uint256) {
-        require(index < _userWithdrawRequestCount[user], "INDEX_OUT_OF_BOUNDS");
-        return _userWithdrawRequests[user][index];
+        require(index < userWithdrawRequestCount[user], "INDEX_OUT_OF_BOUNDS");
+        return userWithdrawRequests[user][index];
     }   
 
     /**
      * @notice Returns a withdraw request by its index
      */
     function requestById(uint256 id) public view virtual returns (WithdrawRequest memory) {
-        require(id < totalWithdrawRequests(), "INDEX_OUT_OF_BOUNDS");
-        return _withdrawRequests[id];
+        require(id < allWithdrawRequests(), "INDEX_OUT_OF_BOUNDS");
+        return withdrawRequests[id];
     }
 
     /**
@@ -487,12 +566,13 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
      */
     function claimAll(address user) external payable nonReentrant {
         require(msg.sender == user, "USER_NOT_SENDER");
-        uint256 requests = _userWithdrawRequestCount[user];
+        uint256 requests = userWithdrawRequestCount[user];
         require(requests > 0, "NO_ACTIVE_REQUESTS");
         for (uint256 i = 0; i < requests; ++i) {
             uint256 id = requestIdFromUserIndex(user, i);
-            WithdrawRequest memory request = _withdrawRequests[id];
-            if (request.fufilled) {
+            WithdrawRequest memory request = withdrawRequests[userWithdrawRequests[user][id]];
+            // Check for fufilled requests that haven't been claimed
+            if (request.fufilled && !request.claimed) {
                 _claim(user, i);
             }
         }
@@ -503,9 +583,6 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
      * @dev This function will revert if the request isn't yet fufilled
      */
     function claim(address user, uint256 id) external payable nonReentrant {
-        WithdrawRequest memory request = _withdrawRequests[id];
-        require(request.fufilled, "REQUEST_NOT_FUFILLED");
-        require(!request.claimed, "REQUEST_ALREADY_CLAIMED");
         _claim(user, id);
     }
 
@@ -513,14 +590,14 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
      * @notice Internal logic for claiming 
      */
     function _claim(address user, uint256 index) internal {
-        require(msg.sender == user, "USER_NOT_SENMDER");
+        require(msg.sender == user, "USER_NOT_SENDER");
         uint256 id = requestIdFromUserIndex(user, index);
-        WithdrawRequest storage request = _withdrawRequests[id];
+        WithdrawRequest storage request = withdrawRequests[id];
+        require(request.fufilled, "REQUEST_NOT_FUFILLED");
+        require(!request.claimed, "ALREADY_CLAIMED");
         request.claimed = true;
-        uint256 avaxAmount = avaxFromGlavax(request.glavaxAmount);
-        IWAVAX(addresses.wavaxAddress()).withdraw(avaxAmount);
-        payable(user).transfer(avaxAmount);
-        emit Claim(user, avaxAmount);
+        payable(user).transfer(request.amount);
+        emit Claim(user, request.amount);
     }
 
     /**
@@ -528,7 +605,7 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
      */
     function cancelAll(address user) external nonReentrant {
         require(msg.sender == user, "USER_NOT_SENDER");
-        uint256 requests = _userWithdrawRequestCount[user];
+        uint256 requests = userWithdrawRequestCount[user];
         require(requests > 0, "NO_ACTIVE_REQUESTS");
         for (uint256 i = requests - 1; i != 0; --i) {
             uint256 id = requestIdFromUserIndex(user, i);
@@ -536,7 +613,7 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
         }
         
         if (requests > 0) {
-            uint256 id = _userWithdrawRequests[user][0];
+            uint256 id = userWithdrawRequests[user][0];
             _cancel(user, id);
         }
     }
@@ -546,7 +623,7 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
      */
     function cancel(address user, uint256 index) external nonReentrant {
         require(msg.sender == user, "USER_NOT_SENDER");
-        uint256 id = _userWithdrawRequests[user][index];
+        uint256 id = userWithdrawRequests[user][index];
         _cancel(user, id);
     }
     
@@ -555,10 +632,21 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
      */
     function _cancel(address user, uint256 id) internal {
         require(msg.sender == user, "USER_NOT_SENDER");
-        WithdrawRequest memory request = _withdrawRequests[id];
-        require(request.glavaxAmount > 0 || request.timestamp > 0, "INVALID_REQUEST");
+        WithdrawRequest storage request = withdrawRequests[id];
+        require(request.amount > 0 || request.timestamp > 0, "INVALID_REQUEST");
+        require(!request.claimed, "ALREADY_CLAIMED");
+
+        // If the user is cancelling a request that is already fufilled, then wrap the AVAX to be deposited into the network
+        if (request.fufilled) {
+            IWAVAX(addresses.wavaxAddress()).deposit{value: request.amount}();
+        }
+
+        request.amount = 0;
+        request.timestamp = 0;
+        request.fufilled = false;
+        request.claimed = false;
         _removeRequest(user, id);
-        _transfer(address(this), user, request.glavaxAmount);
+        _transfer(address(this), user, request.amount);
         emit CancelWithdrawRequest(user, id);
     }
 
@@ -568,25 +656,25 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
      *      `id` refers to the actual request ID to get the request data 
      */
     function _removeRequest(address user, uint256 id) internal {
-        uint256 backIndex = _userWithdrawRequestCount[user] - 1;
-        uint256 toDeleteIndex = _withdrawRequestIndex[id];
+        uint256 backIndex = userWithdrawRequestCount[user] - 1;
+        uint256 toDeleteIndex = withdrawRequestIndex[id];
 
         // When the token to delete is the last token, the swap operation is unnecessary
         if (toDeleteIndex != backIndex) {
-            uint256 backId = _userWithdrawRequests[user][backIndex];
+            uint256 backId = userWithdrawRequests[user][backIndex];
             
             // Move the request thats at the back of the queue to the index of the token we are deleting
             // This lets us reduce the total withdraw requests and still be able to iterate over the total amount
-            _userWithdrawRequests[user][toDeleteIndex] = backId;
+            userWithdrawRequests[user][toDeleteIndex] = backId;
 
             // Now move the request we are deleting to the back of the list
-            _withdrawRequestIndex[backId] = toDeleteIndex;
+            withdrawRequestIndex[backId] = toDeleteIndex;
         }
 
         // This also deletes the contents at the last position of the array
-        delete _withdrawRequestIndex[id];
-        delete _userWithdrawRequests[user][backIndex];
-        _userWithdrawRequestCount[user]--;
+        delete withdrawRequestIndex[id];
+        delete userWithdrawRequests[user][backIndex];
+        userWithdrawRequestCount[user]--;
     }
 
     /**
@@ -610,23 +698,24 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
 
     /**
      * @notice Fufills a user withdrawal
+     * @dev When a user withdrawal is fufilled, the AVAX is held inside the contract (i.e. `address(this).balance`).
+     *      The request is marked as fufilled and the contract burns it's shares that it assumes ownership over for the repayment period. 
      */
     function _fufillUserWithdrawals(uint256 amount) internal {
         IWAVAX(addresses.wavaxAddress()).withdraw(amount);
         uint256 totalAvax = address(this).balance;
-        uint256 totalGlavax = glavaxFromAvax(totalAvax);
-        for (uint256 i = _totalWithdrawRequestsFufilled; i < _totalWithdrawRequests; ++i) {
-            WithdrawRequest storage request =  _withdrawRequests[i];
-            if (totalGlavax >= request.glavaxAmount) {
+        for (uint256 i = totalWithdrawRequestsFufilled; i < totalWithdrawRequests; ++i) {
+            WithdrawRequest storage request =  withdrawRequests[i];
+            if (totalAvax >= request.amount) {
                 request.fufilled = true;
-                request.avaxAmount = avaxFromGlavax(request.glavaxAmount);
+
+                totalAvax -= request.amount;
+                ++totalWithdrawRequestsFufilled;
 
                 // Hold the users withdrawal in native AVAX and burn the contract held glAVAX
-                _burn(address(this), request.glavaxAmount);
+                _burnShares(address(this), request.amount);
 
-                totalAvax -= request.avaxAmount;
-                totalGlavax -= request.glavaxAmount;
-                ++_totalWithdrawRequestsFufilled;
+                emit FufilledUserWithdrawal(request.user, i, amount);
             } else {
                 break;
             }
@@ -634,14 +723,11 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
     }
 
     /**
-     * @notice Returns the total amount of glAVAX that has been requested for withdrawal
+     * @notice Returns the total amount of AVAX that has been requested for withdrawal
+     * @dev This is the glAVAX balance of the contract, as it takes custody of the tokens.
      */
-    function totalWithdrawRequests() public view returns (uint256) {
-        uint256 total = 0;
-        for (uint256 i = _totalWithdrawRequestsFufilled; i < _totalWithdrawRequests; ++i) {
-            total += avaxFromGlavax(_withdrawRequests[i].glavaxAmount);
-        }
-        return total;
+    function allWithdrawRequests() public view returns (uint256) {
+        return balanceOf(address(this));
     }
 
      /**
@@ -657,20 +743,22 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
         require(from != address(0), "ERC20: transfer from the zero address");
         require(to != address(0), "ERC20: transfer to the zero address");
 
-        _beforeTokenTransfer(from, to, amount);
+        uint256 shareAmount = sharesFromAvax(amount);
 
-        uint256 fromBalance = _balances[from];
-        require(fromBalance >= amount, "ERC20: transfer amount exceeds balance");
+        _beforeTokenTransfer(from, to, shareAmount);
+
+        uint256 fromBalance = _shares[from];
+        require(fromBalance >= shareAmount, "ERC20: transfer amount exceeds balance");
         unchecked {
-            _balances[from] = fromBalance - amount;
+            _shares[from] = fromBalance - shareAmount;
             // Overflow not possible: the sum of all balances is capped by totalSupply, and the sum is preserved by
             // decrementing then incrementing.
-            _balances[to] += amount;
+            _shares[to] += shareAmount;
         }
 
-        emit Transfer(from, to, amount);
+        emit Transfer(from, to, shareAmount);
 
-        _afterTokenTransfer(from, to, amount);
+        _afterTokenTransfer(from, to, shareAmount);
     }
 
     function name() external view virtual returns (string memory) {
@@ -683,14 +771,6 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
 
     function decimals() external view virtual returns (uint8) {
         return DECIMALS;
-    }
-
-    function totalSupply() public view virtual override returns (uint256) {
-        return _totalGlavax;
-    }
-
-    function balanceOf(address account) public view virtual override returns (uint256) {
-        return _balances[account];
     }
 
     function transfer(address to, uint256 amount) public virtual override returns (bool) {
@@ -742,8 +822,8 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
 
         _beforeTokenTransfer(address(0), account, amount);
 
-        _totalGlavax += amount;
-        _balances[account] += amount;
+        _totalShares += amount;
+        _shares[account] += amount;
         emit Transfer(address(0), account, amount);
 
         _afterTokenTransfer(address(0), account, amount);
@@ -754,12 +834,12 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Reent
 
         _beforeTokenTransfer(account, address(0), amount);
 
-        uint256 accountBalance = _balances[account];
+        uint256 accountBalance = _shares[account];
         require(accountBalance >= amount, "ERC20: burn amount exceeds balance");
         unchecked {
-            _balances[account] = accountBalance - amount;
+            _shares[account] = accountBalance - amount;
         }
-        _totalGlavax -= amount;
+        _totalShares -= amount;
 
         emit Transfer(account, address(0), amount);
 

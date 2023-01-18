@@ -30,6 +30,7 @@ contract GReservePool is Initializable, IGReservePool, AccessControlManager {
 
     struct Strategy {
         IGReserveStrategy logic;
+        uint256 deposited;
         uint256 weight;
     }
 
@@ -74,9 +75,34 @@ contract GReservePool is Initializable, IGReservePool, AccessControlManager {
     }
 
     /**
-     * @notice Clears the strategies fro
+     * @notice Adds a new strategy to the reserve pool, this is a setup function
+     * 
+     *         Requirements:
+     *              - There can only be upwards of 5 strategies, including the default (just holding it in the contract)
+     *              - There has to be no active deposits on the reserve pool (i.e. this contract manages 0 AVAX)
+     */
+    function addStrategy(IGReserveStrategy strategy, uint256 weight) external isRole(RESERVE_POOL_MANAGER) {
+        require(_totalReserves == 0, "ACTIVE_DEPOSITS");
+        require(_strategyCount < _maxStrategies, "TOO_MANY_STRATEGIES");
+        _strategies[_strategyCount] = Strategy({ logic: strategy, weight: weight, deposited: 0 });
+        _strategyCount++;
+        _totalWeight += weight;
+
+        // Approve the Aave strategy to spend the balance of `asset` in this contract
+        // This is required so that when a deposit is made the Aave strategy can move funds in 
+        IERC20Upgradeable(WAVAX).approve(address(strategy), type(uint256).max);
+    }
+
+    /**
+     * @notice Clears and resets the strategies on the reserve pool, this is a setup function. 
+     *
+     *         Requirements:
+     *              - There has to be no active deposits on the reserve pool (i.e. this contract manages 0 AVAX)
      */
     function clearStrategies() external isRole(RESERVE_POOL_MANAGER) {
+        require(_totalReserves == 0, "ACTIVE_DEPOSITS");
+
+        // Then clears the strategies
         for (uint64 i = 1; i < _strategyCount; ++i) {
             delete _strategies[i];
         }
@@ -86,24 +112,9 @@ contract GReservePool is Initializable, IGReservePool, AccessControlManager {
         _totalWeight = 100;
         _strategies[0].weight = 100;
     }
-
-    /**
-     * @notice Adds a new strategy to the reserve pool
-     * @dev Be weary as multiple strategies could increase the gas consumption of the entire protocol
-     */
-    function addStrategy(IGReserveStrategy strategy, uint256 weight) external isRole(RESERVE_POOL_MANAGER) {
-        require(_strategyCount < _maxStrategies, "TOO_MANY_STRATEGIES");
-        _strategies[_strategyCount] = Strategy({ logic: strategy, weight: weight });
-        _strategyCount++;
-        _totalWeight += weight;
-
-        // Approve the Aave strategy to spend the balance of `asset` in this contract
-        // This is required so that when a deposit is made the Aave strategy can move funds in 
-        IERC20Upgradeable(WAVAX).approve(address(strategy), type(uint256).max);
-    }
     
     /**
-     * @notice Returns the total reserves
+     * @notice Returns the total amount of AVAX this contract manages
      */
     function totalReserves() virtual external view returns (uint256) {
         return _totalReserves;
@@ -124,9 +135,10 @@ contract GReservePool is Initializable, IGReservePool, AccessControlManager {
         }
 
         for (uint64 i = 1; i < _strategyCount; ++i) {
-            Strategy memory strategy = _strategies[i];
+            Strategy storage strategy = _strategies[i];
             uint256 depositAmount = strategy.weight * amount / _totalWeight;
             strategy.logic.deposit(depositAmount);
+            strategy.deposited += depositAmount;
         }
 
         _totalReserves += deposited;
@@ -134,9 +146,10 @@ contract GReservePool is Initializable, IGReservePool, AccessControlManager {
     }
 
     /**
-     * @notice Withdraws AVAX from the reserve pool
+     * @notice Withdraws an `amount` of AVAX from the reserve pool
+     * @dev Equally withdraws from each strategy based on the weightings
      */
-    function withdraw(uint256 amount) virtual external isRole(RESERVE_POOL_MANAGER) {
+    function withdraw(uint256 amount) virtual public isRole(RESERVE_POOL_MANAGER) {
         require(amount > 0, "ZERO_WITHDRAW");
         uint256 totalAmount = amount;
 
@@ -146,14 +159,24 @@ contract GReservePool is Initializable, IGReservePool, AccessControlManager {
         }
 
         for (uint64 i = 1; i < _strategyCount; ++i) {
-            Strategy memory strategy = _strategies[i];
+            Strategy storage strategy = _strategies[i];
             uint256 withdrawAmount = strategy.weight * amount / _totalWeight;
             strategy.logic.withdraw(withdrawAmount);
+            strategy.deposited -= withdrawAmount;
         }
 
         IERC20Upgradeable(WAVAX).transferFrom(address(this), msg.sender, totalAmount);
 
         _totalReserves -= totalAmount;
         emit Withdraw(msg.sender, totalAmount);
+    }
+
+    /**
+     * @notice Helper function to withdraw all currently deposited AVAX from the contract
+     * @dev    This is only ever used to help reset and reconfigure strategies
+     */
+    function withdrawAll() virtual public isRole(RESERVE_POOL_MANAGER) {
+        require(_totalReserves > 0, "NO_RESERVES");
+        withdraw(_totalReserves);
     }
 }
