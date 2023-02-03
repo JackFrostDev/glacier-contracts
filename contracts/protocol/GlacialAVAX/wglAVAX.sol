@@ -14,9 +14,9 @@ import { GlacierAddressBook } from "../../GlacierAddressBook.sol";
 import { IglAVAX } from "../../interfaces/IglAVAX.sol";
 
 /**
- * @title  Glacial AVAX ERC-20 token implementation
+ * @title  Wrapped Glacial AVAX ERC-20 token implementation
  * @author Jack Frost
- * @notice GlacialAvax (glAVAX) is a DeFi-friendly AVAX derivative that represents AVAX deposited into the Glacier protocol. It can be redeemed back for AVAX at an exchange rate that builds value over time based on the 
+ * @notice Wrapped Glacial AVAX (wglAVAX) is a DeFi-friendly glAVAX derivative that represents AVAX deposited into the Glacier protocol. It can be redeemed back for AVAX at an exchange rate that builds value over time based on the 
  *         performance and accrued rewards from the Glacier network.
  *
  *         Handles all of the depositing and withdrawing, the exchange rate between AVAX <-> glAVAX, the rebalancing logic and the withdraw requests.

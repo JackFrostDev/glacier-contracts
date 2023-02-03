@@ -15,7 +15,7 @@ import { GlacierAddressBook } from "../../GlacierAddressBook.sol";
 /**
  * @title  Interest bearing ERC-20 token implementation
  * @author Jack Frost
- * @notice Glacial Avax (glAVAX) is an AVAX derivative ERC-20 token that represents AVAX deposited into the Glacier protocol.
+ * @notice Glacial AVAX (glAVAX) is an AVAX derivative ERC-20 token that represents AVAX deposited into the Glacier protocol.
  *         
  * Users can mint glAVAX by depositing AVAX at a 1:1 rate, where the contract will give the user shares of the overall network depending on their
  * proportion of AVAX against the proportion of overall AVAX.
@@ -641,12 +641,13 @@ contract glAVAX is Initializable, IERC20Upgradeable, AccessControlManager, Pausa
             IWAVAX(addresses.wavaxAddress()).deposit{value: request.amount}();
         }
 
+        uint256 userTokens = request.amount;
         request.amount = 0;
         request.timestamp = 0;
         request.fufilled = false;
         request.claimed = false;
         _removeRequest(user, id);
-        _transfer(address(this), user, request.amount);
+        _transfer(address(this), user, userTokens);
         emit CancelWithdrawRequest(user, id);
     }
 
