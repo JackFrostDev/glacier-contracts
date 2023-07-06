@@ -1,0 +1,19 @@
+node_modules
+.env
+coverage
+coverage.json
+typechain
+typechain-types
+
+#Hardhat files
+cache
+artifacts
+data
+.openzeppelin
+
+#Foundry files
+cache_forge/
+out/
+lcov.info
+
+#My Files
