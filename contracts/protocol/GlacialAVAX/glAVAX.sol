@@ -74,16 +74,15 @@ contract glAVAX is
     /// @notice The current amount to be withdrawn from the network
     uint256 public withdrawRequestTotal;
     
-    /// @notice The total of all withdraw requested (claimed or not, canceled or not)
-    uint256 public withdrawThreatedAllTimeTotal;
+    /// @notice The all time volume of AVAX that has gone through "completed" withdraw requests (i.e. claimed or cancelled)  
+    uint256 public totalWithdrawRequestAmount;
 
     struct WithdrawRequest {
         address user;
         bool claimed;
         bool canceled;
         uint256 amount;
-        // amount threated before this request, to know the order
-        uint256 amountThreated;
+        uint256 pointer; // The pointer is used to index into the `totalWithdrawRequestAmount` variable
         uint256 shares;
     }
 
@@ -633,7 +632,7 @@ contract glAVAX is
         require(amount <= balanceOf(user), "INSUFFICIENT_BALANCE");
 
         WithdrawRequest memory request =
-            WithdrawRequest({user: user, amount: amount, canceled: false, claimed: false, amountThreated: withdrawThreatedAllTimeTotal, shares: sharesFromAvax(amount)});
+            WithdrawRequest({user: user, amount: amount, canceled: false, claimed: false, pointer: totalAmountWithdrawn, shares: sharesFromAvax(amount)});
 
         // Setup the withdraw request data
         withdrawRequests[totalWithdrawRequests] = request;
@@ -738,19 +737,18 @@ contract glAVAX is
     }
 
     /**
-     * @notice lets you know if the user can claim is withdrawal
+     * @notice Determines whether a given request is eligible for claiming
      */
     function _canClaim(WithdrawRequest memory request) private view returns (bool){
-        return !request.claimed && !request.canceled &&
-         withdrawThreatedAllTimeTotal >= request.amountThreated + request.amount; 
+        return !request.claimed && !request.canceled && totalWithdrawRequestAmount >= request.pointer + request.amount; 
     }
 
     /**
-     * @notice update total withdraw request amount after a claim or a cancel
+     * @notice Update total withdraw request amount after a claim or a cancel
      */
     function _updateWithdrawTotal(uint256 amount) private {
         withdrawRequestTotal -= amount;
-        withdrawThreatedAllTimeTotal += amount; 
+        totalWithdrawRequestAmount += amount; 
     }         
 
     /**
