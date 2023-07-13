@@ -632,7 +632,7 @@ contract glAVAX is
         require(amount <= balanceOf(user), "INSUFFICIENT_BALANCE");
 
         WithdrawRequest memory request =
-            WithdrawRequest({user: user, amount: amount, canceled: false, claimed: false, pointer: totalAmountWithdrawn, shares: sharesFromAvax(amount)});
+            WithdrawRequest({user: user, amount: amount, canceled: false, claimed: false, pointer: totalWithdrawRequestAmount, shares: sharesFromAvax(amount)});
 
         // Setup the withdraw request data
         withdrawRequests[totalWithdrawRequests] = request;
